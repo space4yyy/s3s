@@ -11,7 +11,7 @@ import requests, msgpack
 from packaging import version
 import iksm, utils
 
-A_VERSION = "0.7.0"
+A_VERSION = "0.8.0"
 
 DEBUG = False
 
@@ -32,7 +32,11 @@ try:
 	config_file.close()
 except (IOError, ValueError):
 	print("Generating new config file.")
-	CONFIG_DATA = {"api_key": "", "acc_loc": "", "gtoken": "", "bullettoken": "", "session_token": "", "f_gen": "https://api.imink.app/f"}
+	CONFIG_DATA = {
+		"api_key": "", "acc_loc": "", "gtoken": "", "bullettoken": "",
+		"session_token": "", "f_gen": "https://nxapi-znca-api.fancy.org.uk/api/znca/f",
+		"nxapi_client_id": ""
+	}
 	config_file = open(config_path, "w")
 	config_file.seek(0)
 	config_file.write(json.dumps(CONFIG_DATA, indent=4, sort_keys=False, separators=(',', ': ')))
@@ -40,6 +44,8 @@ except (IOError, ValueError):
 	config_file = open(config_path, "r")
 	CONFIG_DATA = json.load(config_file)
 	config_file.close()
+
+iksm.NXAPI_AUTH_CLIENT_ID = CONFIG_DATA.get("nxapi_client_id", "")
 
 # SET GLOBALS
 API_KEY       = CONFIG_DATA["api_key"]       # for stat.ink

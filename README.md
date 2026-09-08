@@ -89,6 +89,14 @@ Automatic token generation involves making a *secure request to a non-Nintendo s
 
 Alternatively, you can use [nsotokengen](https://github.com/clovervidia/nsotokengen) or [nxapi-znca-api](https://github.com/samuelthomas2774/nxapi-znca-api) as a drop-in replacement (customizable in `config.txt`) to generate tokens locally, i.e. without calls to a third-party API.
 
+When `f_gen` is set to `https://nxapi-znca-api.fancy.org.uk/api/znca/f`, `config.txt` must contain an `nxapi_client_id`. To obtain one, sign in to [nxapi-auth](https://nxapi-auth.fancy.org.uk), open the [OAuth clients page](https://nxapi-auth.fancy.org.uk/oauth/clients), and register an OAuth client. For local s3s usage, a public client is sufficient; request the `ca:gf`, `ca:er`, and `ca:dr` scopes. Copy the generated client ID into `config.txt`:
+
+```json
+"nxapi_client_id": "your-nxapi-auth-client-id"
+```
+
+The client ID belongs to nxapi-auth and is unrelated to your Nintendo Account credentials. Do not put an access token, session token, or Nintendo `id_token` in this field.
+
 ### Manual
 
 Users who decide against using automatic token generation may instead retrieve tokens manually via SplatNet 3.

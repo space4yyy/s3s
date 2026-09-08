@@ -2,7 +2,7 @@
 # https://github.com/frozenpandaman/s3s
 # License: GPLv3
 
-import base64, hashlib, json, os, re, sys, urllib
+import base64, hashlib, json, os, re, sys, time, urllib
 import requests
 from bs4 import BeautifulSoup
 
@@ -16,6 +16,15 @@ WEB_VIEW_VER_FALLBACK = "10.0.0-88706e32" # fallback for current splatnet 3 ver
 SPLATNET3_URL         = "https://api.lp1.av5ja.srv.nintendo.net"
 GRAPHQL_URL           = SPLATNET3_URL + "/api/graphql"
 F_GEN_URL             = "unknown"
+NXAPI_AUTH_URL        = "https://nxapi-auth.fancy.org.uk/api/oauth/token"
+NXAPI_AUTH_SCOPE      = "ca:gf ca:er ca:dr"
+ZNC_URL               = "https://api-lp1.znc.srv.nintendo.net"
+NXAPI_AUTH_CLIENT_ID  = ""
+# Fixed compatibility identifier used by the upstream nxapi client.
+NXAPI_CLIENT_VERSION  = "w8zSLBsxR7rVoGJA"
+NXAPI_AUTH_TOKEN      = None
+NXAPI_AUTH_EXPIRES_AT = 0
+F_API_TIMEOUT_RETRIES = 2
 
 # functions in this file & call stack:
 # - get_nsoapp_version()
@@ -26,6 +35,129 @@ F_GEN_URL             = "unknown"
 # - enter_tokens()
 
 session = requests.Session()
+
+
+def get_nxapi_auth_token():
+	'''Gets and caches an OAuth access token for the nxapi f-generation API.'''
+
+	global NXAPI_AUTH_TOKEN, NXAPI_AUTH_EXPIRES_AT
+	if NXAPI_AUTH_TOKEN and time.time() < NXAPI_AUTH_EXPIRES_AT - 30:
+		return NXAPI_AUTH_TOKEN
+
+	client_id = NXAPI_AUTH_CLIENT_ID
+	if not client_id:
+		print("nxapi_client_id is not set in config.txt.")
+		sys.exit(1)
+
+	try:
+		r = requests.post(
+			NXAPI_AUTH_URL,
+			headers={'Accept': 'application/json'},
+			data={
+				'grant_type': 'client_credentials',
+				'client_id': client_id,
+				'scope': NXAPI_AUTH_SCOPE,
+			},
+			timeout=30,
+		)
+		container = r.json()
+		if not r.ok:
+			print(f"Error obtaining nxapi-auth token (HTTP {r.status_code}):")
+			print(json.dumps(container, indent=2, ensure_ascii=False))
+			sys.exit(1)
+
+		NXAPI_AUTH_TOKEN = container["access_token"]
+		NXAPI_AUTH_EXPIRES_AT = time.time() + int(container.get("expires_in", 0))
+		return NXAPI_AUTH_TOKEN
+	except (requests.RequestException, ValueError, KeyError, TypeError):
+		print("Could not obtain an nxapi-auth access token. Please try again later.")
+		sys.exit(1)
+
+
+def is_nxapi_f_url(url):
+	'''Returns whether a f-generation URL is hosted by nxapi-znca-api.'''
+
+	return url.startswith("https://nxapi-znca-api.fancy.org.uk/")
+
+
+def nxapi_endpoint(f_gen_url, path):
+	'''Builds an endpoint URL next to the configured nxapi f endpoint.'''
+
+	return os.path.dirname(f_gen_url).rstrip('/') + '/' + path.lstrip('/')
+
+
+def post_coral_request(url, body, encrypted_body, nsoapp_version, coral_access_token=None):
+	'''Sends a Coral request, using nxapi encryption when available.'''
+
+	app_head = {
+		'X-Platform':       'Android',
+		'X-ProductVersion': nsoapp_version,
+		'Content-Type':     'application/json; charset=utf-8',
+		'Accept':           'application/json',
+		'Accept-Encoding':  'gzip',
+		'User-Agent':       f'com.nintendo.znca/{nsoapp_version}(Android/12)',
+	}
+	if coral_access_token:
+		app_head['Authorization'] = f'Bearer {coral_access_token}'
+	request_data = {'json': body}
+	if encrypted_body is not None:
+		app_head['Content-Type'] = 'application/octet-stream'
+		app_head['Accept'] = 'application/octet-stream, application/json'
+		request_data = {'data': encrypted_body}
+
+	return requests.post(url, headers=app_head, timeout=60, **request_data)
+
+
+def parse_coral_response(response, f_gen_url, encrypted=False):
+	'''Parses a Coral response and decrypts it through nxapi when required.'''
+
+	if not encrypted:
+		return response.json()
+
+	decrypt_body = {
+		'data': base64.b64encode(response.content).decode('ascii')
+	}
+	decrypt_response = requests.post(
+		nxapi_endpoint(f_gen_url, 'decrypt-response'),
+		headers={
+			'Authorization': f'Bearer {get_nxapi_auth_token()}',
+			'Content-Type': 'application/json',
+			'Accept': 'text/plain',
+			'User-Agent': f's3s/{S3S_VERSION}',
+		},
+		json=decrypt_body,
+		timeout=60,
+	)
+	decrypt_response.raise_for_status()
+	decrypted_text = decrypt_response.text
+	try:
+		decrypted_json = decrypt_response.json()
+		if isinstance(decrypted_json, dict) and isinstance(decrypted_json.get('data'), str):
+			decrypted_text = decrypted_json['data']
+	except ValueError:
+		pass
+	return json.loads(decrypted_text)
+
+
+def call_coral_api_with_f(access_token, step, f_gen_url, user_id,
+		coral_user_id, url, parameter, nsoapp_version):
+	'''Generates f, sends a Coral request, and parses its response.'''
+
+	f, uuid, timestamp, encrypted_body = call_f_api(
+		access_token, step, f_gen_url, user_id, coral_user_id=coral_user_id,
+		encrypt_url=url, encrypt_parameter=parameter
+	)
+	request_parameter = dict(parameter)
+	request_parameter.update({'f': f, 'requestId': uuid, 'timestamp': timestamp})
+	if coral_user_id is not None and 'registrationToken' in request_parameter:
+		request_parameter['registrationToken'] = access_token
+	body = {'parameter': request_parameter}
+	response = post_coral_request(
+		url, body, encrypted_body, nsoapp_version,
+		coral_access_token=access_token if step == 2 else None
+	)
+	return parse_coral_response(response, f_gen_url, encrypted_body is not None)
+
 
 def get_nsoapp_version():
 	'''Fetches the current Nintendo Switch Online app version from f API or the Apple App Store and sets it globally.'''
@@ -49,14 +181,22 @@ def get_nsoapp_version():
 		try: # try to get NSO version from f API
 			f_conf_url = os.path.dirname(F_GEN_URL) + "/config" # default endpoint for imink API
 			f_conf_header = {'User-Agent': f's3s/{S3S_VERSION}'}
-			f_conf_rsp = requests.get(f_conf_url, headers=f_conf_header)
+			if is_nxapi_f_url(F_GEN_URL):
+				f_conf_header['Authorization'] = f'Bearer {get_nxapi_auth_token()}'
+			f_conf_rsp = requests.get(f_conf_url, headers=f_conf_header, timeout=30)
+			f_conf_rsp.raise_for_status()
 			f_conf_json = json.loads(f_conf_rsp.text)
 			ver = f_conf_json["nso_version"]
 
 			NSOAPP_VERSION = ver
 
 			return NSOAPP_VERSION
+		except SystemExit:
+			raise
 		except: # fallback to apple app store
+			if is_nxapi_f_url(F_GEN_URL):
+				print("Could not determine the Nintendo Switch Online app version from nxapi.")
+				sys.exit(1)
 			try:
 				page = requests.get("https://apps.apple.com/us/app/nintendo-switch-online/id1234806557")
 				soup = BeautifulSoup(page.text, 'html.parser')
@@ -307,45 +447,34 @@ def get_gtoken(f_gen_url, session_token, ver):
 	user_id       = user_info["id"]
 
 	# get access token
-	body = {}
-	try:
-		id_token = id_response["id_token"]
-		f, uuid, timestamp = call_f_api(id_token, 1, f_gen_url, user_id)
+	id_token = id_response["id_token"]
+	login_url = ZNC_URL + '/v4/Account/Login'
+	login_parameter = {
+		'f':          '',
+		'language':   user_lang,
+		'naBirthday': user_info["birthday"],
+		'naCountry':  user_country,
+		'naIdToken':  id_token,
+		'requestId':  '',
+		'timestamp':  0
+	}
+	def request_login():
+		return call_coral_api_with_f(
+			id_token, 1, f_gen_url, user_id, None, login_url,
+			login_parameter, nsoapp_version
+		)
 
-		parameter = {
-			'f':          f,
-			'language':   user_lang,
-			'naBirthday': user_info["birthday"],
-			'naCountry':  user_country,
-			'naIdToken':  id_token,
-			'requestId':  uuid,
-			'timestamp':  timestamp
-		}
+	try:
+		splatoon_token = request_login()
 	except SystemExit:
+		raise
+	except (json.decoder.JSONDecodeError, requests.RequestException, ValueError):
+		print("Got non-JSON response from Nintendo (in Account/Login step). Please try again.")
 		sys.exit(1)
 	except:
 		print("Error(s) from Nintendo:")
 		print(json.dumps(id_response, indent=2))
 		print(json.dumps(user_info, indent=2))
-		sys.exit(1)
-	body["parameter"] = parameter
-
-	app_head = {
-		'X-Platform':       'Android',
-		'X-ProductVersion': nsoapp_version,
-		'Content-Type':     'application/json; charset=utf-8',
-		'Content-Length':   str(990 + len(f)),
-		'Connection':       'Keep-Alive',
-		'Accept-Encoding':  'gzip',
-		'User-Agent':       f'com.nintendo.znca/{nsoapp_version}(Android/14)',
-	}
-
-	url = "https://api-lp1.znc.srv.nintendo.net/v3/Account/Login"
-	r = requests.post(url, headers=app_head, json=body)
-	try:
-		splatoon_token = json.loads(r.text)
-	except json.decoder.JSONDecodeError:
-		print("Got non-JSON response from Nintendo (in Account/Login step). Please try again.")
 		sys.exit(1)
 
 	try:
@@ -354,14 +483,7 @@ def get_gtoken(f_gen_url, session_token, ver):
 	except:
 		# retry once if 9403/9599 error from nintendo
 		try:
-			f, uuid, timestamp = call_f_api(access_token, 1, f_gen_url, user_id)
-			body["parameter"]["f"]         = f
-			body["parameter"]["requestId"] = uuid
-			body["parameter"]["timestamp"] = timestamp
-			app_head["Content-Length"]     = str(990 + len(f))
-			url = "https://api-lp1.znc.srv.nintendo.net/v3/Account/Login"
-			r = requests.post(url, headers=app_head, json=body)
-			splatoon_token = json.loads(r.text)
+			splatoon_token = request_login()
 			access_token  = splatoon_token["result"]["webApiServerCredential"]["accessToken"]
 			coral_user_id = str(splatoon_token["result"]["user"]["id"])
 		except:
@@ -370,34 +492,24 @@ def get_gtoken(f_gen_url, session_token, ver):
 			print("Try re-running the script. Or, if the NSO app has recently been updated, you may temporarily change `USE_OLD_NSOAPP_VER` to True at the top of iksm.py for a workaround.")
 			sys.exit(1)
 
-		f, uuid, timestamp = call_f_api(access_token, 2, f_gen_url, user_id, coral_user_id=coral_user_id)
-
 	# get web service token
-	app_head = {
-		'X-Platform':       'Android',
-		'X-ProductVersion': nsoapp_version,
-		'Authorization':    f'Bearer {access_token}',
-		'Content-Type':     'application/json; charset=utf-8',
-		'Content-Length':   '391',
-		'Accept-Encoding':  'gzip',
-		'User-Agent':       f'com.nintendo.znca/{nsoapp_version}(Android/14)'
-	}
-
-	body = {}
-	parameter = {
-		'f':                 f,
+	service_url = ZNC_URL + '/v4/Game/GetWebServiceToken'
+	service_parameter = {
+		'f':                 '',
 		'id':                4834290508791808,
-		'registrationToken': access_token,
-		'requestId':         uuid,
-		'timestamp':         timestamp
+		'registrationToken': '',
+		'requestId':         '',
+		'timestamp':         0
 	}
-	body["parameter"] = parameter
+	def request_service_token():
+		return call_coral_api_with_f(
+			access_token, 2, f_gen_url, user_id, coral_user_id, service_url,
+			service_parameter, nsoapp_version
+		)
 
-	url = "https://api-lp1.znc.srv.nintendo.net/v2/Game/GetWebServiceToken"
-	r = requests.post(url, headers=app_head, json=body)
 	try:
-		web_service_resp = json.loads(r.text)
-	except json.decoder.JSONDecodeError:
+		web_service_resp = request_service_token()
+	except (json.decoder.JSONDecodeError, requests.RequestException, ValueError):
 		print("Got non-JSON response from Nintendo (in Game/GetWebServiceToken step). Please try again.")
 		sys.exit(1)
 
@@ -406,13 +518,7 @@ def get_gtoken(f_gen_url, session_token, ver):
 	except:
 		# retry once if 9403/9599 error from nintendo
 		try:
-			f, uuid, timestamp = call_f_api(access_token, 2, f_gen_url, user_id, coral_user_id=coral_user_id)
-			body["parameter"]["f"]         = f
-			body["parameter"]["requestId"] = uuid
-			body["parameter"]["timestamp"] = timestamp
-			url = "https://api-lp1.znc.srv.nintendo.net/v2/Game/GetWebServiceToken"
-			r = requests.post(url, headers=app_head, json=body)
-			web_service_resp = json.loads(r.text)
+			web_service_resp = request_service_token()
 			web_service_token = web_service_resp["result"]["accessToken"]
 		except:
 			print("Error from Nintendo (in Game/GetWebServiceToken step):")
@@ -468,17 +574,22 @@ def get_bullet(web_service_token, app_user_agent, user_lang, user_country):
 	return bullet_token
 
 
-def call_f_api(access_token, step, f_gen_url, user_id, coral_user_id=None):
-	'''Passes naIdToken & user ID to f generation API (default: imink) & fetches response (f token, UUID, timestamp).'''
+def call_f_api(access_token, step, f_gen_url, user_id, coral_user_id=None,
+		encrypt_url=None, encrypt_parameter=None):
+	'''Gets f data and optionally an encrypted Coral request body from the f API.'''
 
 	try:
 		nsoapp_version = get_nsoapp_version()
 		api_head = {
 			'User-Agent':      f's3s/{S3S_VERSION}',
 			'Content-Type':    'application/json; charset=utf-8',
+			'Accept':          'application/json',
 			'X-znca-Platform': 'Android',
 			'X-znca-Version':  nsoapp_version
 		}
+		if is_nxapi_f_url(f_gen_url):
+			api_head['Authorization'] = f'Bearer {get_nxapi_auth_token()}'
+			api_head['X-znca-Client-Version'] = NXAPI_CLIENT_VERSION
 		api_body = { # 'timestamp' & 'request_id' (uuid v4) set automatically
 			'token':       access_token,
 			'hash_method': step, # 1 = coral (NSO) token, 2 = webservicetoken
@@ -486,14 +597,32 @@ def call_f_api(access_token, step, f_gen_url, user_id, coral_user_id=None):
 		}
 		if step == 2 and coral_user_id is not None:
 			api_body["coral_user_id"] = coral_user_id
+		if is_nxapi_f_url(f_gen_url) and encrypt_url and encrypt_parameter is not None:
+			api_body["encrypt_token_request"] = {
+				"url": encrypt_url,
+				"parameter": encrypt_parameter
+			}
 
-		api_response = requests.post(f_gen_url, data=json.dumps(api_body), headers=api_head)
-		resp = json.loads(api_response.text)
+		for attempt in range(F_API_TIMEOUT_RETRIES + 1):
+			api_response = requests.post(f_gen_url, data=json.dumps(api_body), headers=api_head, timeout=60)
+			resp = json.loads(api_response.text)
+			if resp.get('error') != 'timeout' or attempt == F_API_TIMEOUT_RETRIES:
+				break
+			time.sleep(2 ** (attempt + 1))
 
 		f = resp["f"]
 		uuid = resp["request_id"]
 		timestamp = resp["timestamp"]
+		encrypted_body = None
+		if is_nxapi_f_url(f_gen_url) and resp.get("encrypted_token_request"):
+			encrypted_data = resp["encrypted_token_request"]
+			encrypted_data += '=' * (-len(encrypted_data) % 4)
+			encrypted_body = base64.urlsafe_b64decode(encrypted_data)
+		if encrypt_url is not None:
+			return f, uuid, timestamp, encrypted_body
 		return f, uuid, timestamp
+	except SystemExit:
+		raise
 	except:
 		try: # if api_response never gets set
 			if api_response.text:
