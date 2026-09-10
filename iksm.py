@@ -21,7 +21,7 @@ NXAPI_AUTH_SCOPE      = "ca:gf ca:er ca:dr"
 ZNC_URL               = "https://api-lp1.znc.srv.nintendo.net"
 NXAPI_AUTH_CLIENT_ID  = ""
 # Fixed compatibility identifier used by the upstream nxapi client.
-NXAPI_CLIENT_VERSION  = "w8zSLBsxR7rVoGJA"
+NXAPI_CLIENT_VERSION  = "d8fAZDPzwimzQ7c6"
 NXAPI_AUTH_TOKEN      = None
 NXAPI_AUTH_EXPIRES_AT = 0
 F_API_TIMEOUT_RETRIES = 2
@@ -69,8 +69,15 @@ def get_nxapi_auth_token():
 		NXAPI_AUTH_TOKEN = container["access_token"]
 		NXAPI_AUTH_EXPIRES_AT = time.time() + int(container.get("expires_in", 0))
 		return NXAPI_AUTH_TOKEN
-	except (requests.RequestException, ValueError, KeyError, TypeError):
-		print("Could not obtain an nxapi-auth access token. Please try again later.")
+	except requests.exceptions.Timeout as exc:
+		print("Could not obtain an nxapi-auth access token: request timed out after 30 seconds.")
+		print(f"Details: {exc}")
+		sys.exit(1)
+	except requests.exceptions.RequestException as exc:
+		print(f"Could not obtain an nxapi-auth access token: {type(exc).__name__}: {exc}")
+		sys.exit(1)
+	except (ValueError, KeyError, TypeError) as exc:
+		print(f"Could not parse the nxapi-auth response: {type(exc).__name__}: {exc}")
 		sys.exit(1)
 
 
@@ -84,6 +91,56 @@ def nxapi_endpoint(f_gen_url, path):
 	'''Builds an endpoint URL next to the configured nxapi f endpoint.'''
 
 	return os.path.dirname(f_gen_url).rstrip('/') + '/' + path.lstrip('/')
+
+
+def _report_nxapi_config_error(f_conf_url, error):
+	'''Prints a useful, non-sensitive error for a failed nxapi config request.'''
+
+	print("Could not determine the Nintendo Switch Online app version from nxapi.")
+	if isinstance(error, requests.exceptions.Timeout):
+		print(f"The nxapi config request timed out after 30 seconds: {f_conf_url}")
+		return
+
+	if isinstance(error, requests.exceptions.HTTPError):
+		response = error.response
+		status = response.status_code if response is not None else "unknown"
+		print(f"The nxapi config request failed with HTTP {status}: {f_conf_url}")
+		if response is not None:
+			trace_id = response.headers.get('X-Trace-Id')
+			content_type = response.headers.get('Content-Type')
+			if trace_id:
+				print(f"Trace ID: {trace_id}")
+			if content_type:
+				print(f"Response content type: {content_type}")
+			try:
+				response_data = response.json()
+			except ValueError:
+				response_data = None
+			if isinstance(response_data, dict):
+				for field in ('error', 'error_description', 'error_message', 'debug_id'):
+					if field in response_data:
+						print(f"{field}: {response_data[field]}")
+			elif isinstance(status, int) and status >= 500:
+				print("The nxapi service may be temporarily unavailable. Check https://nxapi-status.fancy.org.uk/")
+		return
+
+	if isinstance(error, requests.exceptions.RequestException):
+		print(f"The nxapi config request failed: {type(error).__name__}: {error}")
+		return
+
+	if isinstance(error, json.JSONDecodeError):
+		print("The nxapi config response was not valid JSON.")
+		return
+
+	if isinstance(error, KeyError):
+		print(f"The nxapi config response is missing the required field: {error.args[0]}.")
+		return
+
+	if isinstance(error, (ValueError, TypeError)):
+		print(f"The nxapi config response is invalid: {error}")
+		return
+
+	print(f"Unexpected error while reading nxapi config: {type(error).__name__}: {error}")
 
 
 def post_coral_request(url, body, encrypted_body, nsoapp_version, coral_access_token=None):
@@ -186,16 +243,21 @@ def get_nsoapp_version():
 			f_conf_rsp = requests.get(f_conf_url, headers=f_conf_header, timeout=30)
 			f_conf_rsp.raise_for_status()
 			f_conf_json = json.loads(f_conf_rsp.text)
+			if not isinstance(f_conf_json, dict):
+				raise TypeError("response root is not a JSON object")
 			ver = f_conf_json["nso_version"]
+			if not isinstance(ver, str) or not ver.strip():
+				raise ValueError("nso_version is empty or has an invalid type")
+			ver = ver.strip()
 
 			NSOAPP_VERSION = ver
 
 			return NSOAPP_VERSION
 		except SystemExit:
 			raise
-		except: # fallback to apple app store
+		except Exception as exc: # fallback to apple app store
 			if is_nxapi_f_url(F_GEN_URL):
-				print("Could not determine the Nintendo Switch Online app version from nxapi.")
+				_report_nxapi_config_error(f_conf_url, exc)
 				sys.exit(1)
 			try:
 				page = requests.get("https://apps.apple.com/us/app/nintendo-switch-online/id1234806557")
